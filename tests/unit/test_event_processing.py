@@ -19,6 +19,7 @@ from api.agent.tools.http_request import execute_http_request as _execute_http_r
 from api.agent.tasks.process_events import process_agent_cron_trigger_task, _remove_orphaned_celery_beat_task
 from api.models import (
     BrowserUseAgent,
+    MCPServerConfig,
     PersistentAgent,
     PersistentAgentCommsEndpoint,
     PersistentAgentMessage,
@@ -26,6 +27,7 @@ from api.models import (
     PersistentAgentCronTrigger,
     PersistentAgentSecret,
     PersistentAgentPromptArchive,
+    PersistentAgentSystemMessage,
 )
 from constants.grant_types import GrantTypeChoices
 from constants.plans import PlanNamesChoices
@@ -122,6 +124,55 @@ class PromptContextBuilderTests(TestCase):
         self.assertIsNotNone(system_message)
         self.assertIn(f"You are a persistent AI agent named '{self.agent.name}'.", system_message['content'])
 
+    def test_mcp_servers_listed_in_prompt(self):
+        """Accessible MCP servers should be enumerated in the prompt context."""
+        MCPServerConfig.objects.create(
+            scope=MCPServerConfig.Scope.PLATFORM,
+            name="test-sheets",
+            display_name="Test Sheets",
+            url="https://mcp.example.com",
+        )
+
+        with patch('api.agent.core.event_processing.ensure_steps_compacted'), \
+             patch('api.agent.core.event_processing.ensure_comms_compacted'):
+            context, _, _ = _build_prompt_context(self.agent)
+
+        user_message = next((m for m in context if m['role'] == 'user'), None)
+        self.assertIsNotNone(user_message)
+        content = user_message['content']
+        self.assertIn("These are the MCP servers you have access to.", content)
+        self.assertIn("Test Sheets", content)
+        self.assertIn("search_tools", content)
+
+    def test_admin_system_message_is_injected_once(self):
+        """Admin-authored system directives should appear in the system prompt and be marked delivered."""
+        directive = PersistentAgentSystemMessage.objects.create(
+            agent=self.agent,
+            body="Drop everything and update the quarterly results deck today.",
+            created_by=self.user,
+        )
+
+        with patch('api.agent.core.event_processing.ensure_steps_compacted'), \
+             patch('api.agent.core.event_processing.ensure_comms_compacted'):
+            context, _, _ = _build_prompt_context(self.agent)
+
+        system_message = next((m for m in context if m['role'] == 'system'), None)
+        self.assertIsNotNone(system_message)
+        content = system_message['content']
+        self.assertIn("SYSTEM NOTICE FROM GOBII OPERATIONS", content)
+        self.assertIn("Drop everything and update the quarterly results deck today.", content)
+
+        directive.refresh_from_db()
+        self.assertIsNotNone(directive.delivered_at)
+
+        with patch('api.agent.core.event_processing.ensure_steps_compacted'), \
+             patch('api.agent.core.event_processing.ensure_comms_compacted'):
+            second_context, _, _ = _build_prompt_context(self.agent)
+
+        second_system = next((m for m in second_context if m['role'] == 'system'), None)
+        self.assertIsNotNone(second_system)
+        self.assertNotIn("Drop everything and update the quarterly results deck today.", second_system['content'])
+
     def test_prompt_archive_saved_to_storage(self):
         """Prompt archives should be written to object storage as compressed JSON."""
         with patch('api.agent.core.event_processing.ensure_steps_compacted'), \
@@ -208,7 +259,8 @@ class PromptContextBuilderTests(TestCase):
         self.assertIsNotNone(archive.step, "Prompt archive should be linked to a step")
         linked_archive = PersistentAgentPromptArchive.objects.get(step=archive.step)
         self.assertEqual(linked_archive.id, archive.id)
-        self.assertEqual(archive.step.prompt_tokens, token_usage["prompt_tokens"])
+        self.assertIsNotNone(archive.step.completion)
+        self.assertEqual(archive.step.completion.prompt_tokens, token_usage["prompt_tokens"])
 
 @tag("batch_event_processing")
 class CronTriggerTaskTests(TestCase):

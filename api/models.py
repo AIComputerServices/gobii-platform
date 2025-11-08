@@ -1,5 +1,5 @@
 import hashlib, secrets, uuid, os, string, re, datetime, json
-from decimal import Decimal
+from decimal import Decimal, ROUND_HALF_UP, ROUND_DOWN
 from typing import Optional, Tuple
 
 import ulid
@@ -517,6 +517,91 @@ class TaskCreditConfig(models.Model):
 
     def __str__(self):
         return "Task credit configuration"
+
+
+class DailyCreditConfig(models.Model):
+    """Singleton configuration controlling soft target UI + pacing."""
+
+    singleton_id = models.PositiveSmallIntegerField(
+        primary_key=True,
+        default=1,
+        editable=False,
+    )
+    slider_min = models.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+        default=Decimal("0"),
+        validators=[MinValueValidator(Decimal("0"))],
+        help_text="Lowest selectable soft target value.",
+    )
+    slider_max = models.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+        default=Decimal("50"),
+        validators=[MinValueValidator(Decimal("0"))],
+        help_text="Highest selectable soft target value.",
+    )
+    slider_step = models.DecimalField(
+        max_digits=6,
+        decimal_places=2,
+        default=Decimal("1"),
+        validators=[MinValueValidator(Decimal("0.01"))],
+        help_text="Increment applied to the soft target slider/input.",
+    )
+    burn_rate_threshold_per_hour = models.DecimalField(
+        max_digits=12,
+        decimal_places=3,
+        default=Decimal("3"),
+        validators=[MinValueValidator(Decimal("0"))],
+        help_text="Preferred maximum credits consumed per hour before agents are asked to slow down.",
+    )
+    burn_rate_window_minutes = models.PositiveIntegerField(
+        default=60,
+        validators=[MinValueValidator(1), MaxValueValidator(1440)],
+        help_text="Window (in minutes) used to compute the rolling burn rate.",
+    )
+    hard_limit_multiplier = models.DecimalField(
+        max_digits=6,
+        decimal_places=2,
+        default=Decimal("2"),
+        validators=[MinValueValidator(Decimal("1"))],
+        help_text="Multiplier applied to the soft target to derive the enforced hard limit.",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = "Daily credit pacing configuration"
+        verbose_name_plural = "Daily credit pacing configuration"
+
+    def clean(self):
+        super().clean()
+        if self.slider_max < self.slider_min:
+            raise ValidationError({"slider_max": "Maximum must be greater than or equal to the minimum value."})
+        integer_fields = {
+            "slider_min": self.slider_min,
+            "slider_max": self.slider_max,
+            "slider_step": self.slider_step,
+        }
+        for field_name, value in integer_fields.items():
+            if value is None:
+                continue
+            if value != value.to_integral_value(rounding=ROUND_DOWN):
+                raise ValidationError({field_name: "Value must be a whole number."})
+
+    def save(self, *args, **kwargs):
+        self.singleton_id = 1
+        result = super().save(*args, **kwargs)
+        from api.services.daily_credit_settings import invalidate_daily_credit_settings_cache
+
+        invalidate_daily_credit_settings_cache()
+        return result
+
+    def delete(self, using=None, keep_parents=False):  # pragma: no cover - deletion discouraged
+        raise ValidationError("DailyCreditConfig cannot be deleted.")
+
+    def __str__(self):
+        return "Daily credit pacing configuration"
 
 
 class ToolCreditCost(models.Model):
@@ -2668,7 +2753,7 @@ class PersistentAgent(models.Model):
     daily_credit_limit = models.PositiveIntegerField(
         null=True,
         blank=True,
-        help_text="Maximum task credits this agent may consume per day. Null means unlimited.",
+        help_text="Soft daily credit target; system enforces a hard stop at 2× this value. Null means unlimited.",
     )
     # Soft-expiration state and interaction tracking
     class LifeState(models.TextChoices):
@@ -2837,12 +2922,30 @@ class PersistentAgent(models.Model):
         schedule_display = self.schedule if self.schedule else "No schedule"
         return f"PersistentAgent: {self.name} (Schedule: {schedule_display})"
 
-    def get_daily_credit_limit_value(self) -> Decimal | None:
-        """Return the configured daily task credit limit, or None if unlimited."""
+    def get_daily_credit_soft_target(self) -> Decimal | None:
+        """Return the configured soft daily credit target, or None if unlimited."""
         limit = self.daily_credit_limit
         if limit is None:
             return None
-        return Decimal(limit)
+        limit_value = limit if isinstance(limit, Decimal) else Decimal(limit)
+        if limit_value == Decimal("0"):
+            return None
+        return limit_value
+
+    def get_daily_credit_hard_limit(self) -> Decimal | None:
+        """Return the derived hard limit (2× soft target) or None for unlimited agents."""
+        from api.services.daily_credit_settings import get_daily_credit_settings
+
+        soft_target = self.get_daily_credit_soft_target()
+        if soft_target is None:
+            return None
+        credit_settings = get_daily_credit_settings()
+        multiplier = credit_settings.hard_limit_multiplier
+        try:
+            multiplier = Decimal(multiplier)
+        except Exception:
+            multiplier = Decimal("2")
+        return (soft_target * multiplier).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
 
     def get_daily_credit_usage(self, usage_date=None) -> Decimal:
         """Return the credits consumed by this agent on the given date."""
@@ -2862,9 +2965,20 @@ class PersistentAgent(models.Model):
 
         return total if total is not None else Decimal("0")
 
+    def get_daily_credit_soft_target_remaining(self, usage_date=None) -> Decimal | None:
+        """Return remaining credits before the soft target is exceeded."""
+        soft_target = self.get_daily_credit_soft_target()
+        if soft_target is None:
+            return None
+        used = self.get_daily_credit_usage(usage_date=usage_date)
+        remaining = soft_target - used
+        if remaining <= Decimal("0"):
+            return Decimal("0")
+        return remaining
+
     def get_daily_credit_remaining(self, usage_date=None) -> Decimal | None:
-        """Return remaining daily credits; None indicates unlimited."""
-        limit = self.get_daily_credit_limit_value()
+        """Return remaining credits before the derived hard limit is enforced."""
+        limit = self.get_daily_credit_hard_limit()
         if limit is None:
             return None
         used = self.get_daily_credit_usage(usage_date=usage_date)
@@ -3491,6 +3605,46 @@ class MCPServerConfig(models.Model):
     @headers.setter
     def headers(self, value: dict[str, str] | None) -> None:
         self.headers_json_encrypted = self._encrypt_json(value)
+
+
+class PersistentAgentSystemMessage(models.Model):
+    """
+    High-priority system directives injected into an agent's system prompt.
+    """
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    agent = models.ForeignKey(
+        PersistentAgent,
+        on_delete=models.CASCADE,
+        related_name="system_prompt_messages",
+        help_text="Agent that should receive this system directive.",
+    )
+    body = models.TextField(help_text="System directive text injected ahead of the agent's instructions.")
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="issued_agent_system_messages",
+        help_text="Admin user that issued this directive.",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    delivered_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text="Timestamp when this directive was injected into the system prompt.",
+    )
+    is_active = models.BooleanField(
+        default=True,
+        help_text="Disable to keep the record but skip injecting it into future prompts.",
+    )
+
+    class Meta:
+        ordering = ["-created_at"]
+
+    def __str__(self):
+        status = "delivered" if self.delivered_at else "pending"
+        return f"System message for {self.agent_id} ({status})"
 
 
 class PersistentAgentMCPServer(models.Model):
@@ -5158,6 +5312,45 @@ class PersistentAgentWebSession(models.Model):
     def __str__(self) -> str:
         return f"WebSession<{self.agent_id}:{self.user_id}:{self.session_key}>"
 
+class PersistentAgentCompletion(models.Model):
+    """Represents a single LLM completion within a persistent agent run."""
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    agent = models.ForeignKey(
+        "PersistentAgent",
+        on_delete=models.CASCADE,
+        related_name="completions",
+        help_text="Agent that triggered this LLM completion.",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    prompt_tokens = models.IntegerField(null=True, blank=True)
+    completion_tokens = models.IntegerField(null=True, blank=True)
+    total_tokens = models.IntegerField(null=True, blank=True)
+    cached_tokens = models.IntegerField(null=True, blank=True)
+    llm_model = models.CharField(max_length=256, null=True, blank=True)
+    llm_provider = models.CharField(max_length=128, null=True, blank=True)
+
+    credits_cost = models.DecimalField(
+        max_digits=12,
+        decimal_places=3,
+        null=True,
+        blank=True,
+        help_text="Credits consumed for this completion (if charged).",
+    )
+    billed = models.BooleanField(default=False, help_text="True once credits were consumed for this completion.")
+    billed_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["agent", "-created_at"], name="pa_completion_recent_idx"),
+        ]
+
+    def __str__(self):
+        return f"Completion {self.llm_model or 'unknown'} @ {self.created_at}"
+
+
 class PersistentAgentStep(models.Model):
     """A single action taken by a PersistentAgent (tool call, internal reasoning, etc.)."""
 
@@ -5169,6 +5362,14 @@ class PersistentAgentStep(models.Model):
         on_delete=models.CASCADE,
         related_name="steps",
         help_text="The persistent agent that executed this step",
+    )
+    completion = models.ForeignKey(
+        "PersistentAgentCompletion",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="steps",
+        help_text="LLM completion that produced this step (if applicable).",
     )
 
     # Credit used for this step
@@ -5188,22 +5389,6 @@ class PersistentAgentStep(models.Model):
 
     created_at = models.DateTimeField(auto_now_add=True)
 
-    # Token usage tracking fields
-    prompt_tokens = models.IntegerField(
-        null=True, 
-        blank=True,
-        help_text="Number of tokens used in the prompt for this step's LLM call"
-    )
-    completion_tokens = models.IntegerField(
-        null=True,
-        blank=True, 
-        help_text="Number of tokens generated in the completion for this step's LLM call"
-    )
-    total_tokens = models.IntegerField(
-        null=True,
-        blank=True,
-        help_text="Total tokens used (prompt + completion) for this step's LLM call"
-    )
     # Credits charged for this step (for audit). If not provided, defaults to configured per‑task cost.
     credits_cost = models.DecimalField(
         max_digits=12,
@@ -5212,24 +5397,6 @@ class PersistentAgentStep(models.Model):
         blank=True,
         help_text="Credits charged for this step; defaults to configured per‑task cost.",
     )
-    cached_tokens = models.IntegerField(
-        null=True,
-        blank=True,
-        help_text="Number of cached tokens used (if provider supports caching)"
-    )
-    llm_model = models.CharField(
-        max_length=256,
-        null=True,
-        blank=True,
-        help_text="LLM model used for this step (e.g., 'claude-3-opus-20240229')"
-    )
-    llm_provider = models.CharField(
-        max_length=128,
-        null=True,
-        blank=True,
-        help_text="LLM provider used for this step (e.g., 'anthropic', 'openai')"
-    )
-
     # Billing rollup flag: has this step been included in a Stripe meter rollup?
     metered = models.BooleanField(default=False, db_index=True, help_text="Marked true once included in Stripe metering rollup.")
     # Temporary batch key used to reserve rows for an idempotent metering batch
@@ -5249,26 +5416,27 @@ class PersistentAgentStep(models.Model):
         return f"Step {preview}..."
 
     def save(self, *args, **kwargs):
+        completion_to_mark = None
+        completion_mark_amount = None
+
         # On creation, optionally consume credits for chargeable steps only.
         if self._state.adding:
             from django.core.exceptions import ValidationError
-            # Determine owner: organization if agent is org-owned; otherwise the agent's user
+
             owner = None
             if self.agent and getattr(self.agent, 'organization', None):
                 owner = self.agent.organization
             elif self.agent:
                 owner = self.agent.user
 
-            # Heuristic: only charge credits for LLM/tool compute steps – indicated by either
-            # an explicit credits_cost override or presence of token/model usage fields.
-            chargeable = (
-                self.credits_cost is not None
-                or self.llm_model is not None
-                or self.prompt_tokens is not None
-                or self.total_tokens is not None
-            )
+            completion_obj = getattr(self, "completion", None) if self.completion_id else None
+            completion_requires_billing = bool(completion_obj and not completion_obj.billed)
+            completion_to_mark = completion_obj if completion_requires_billing else None
+            completion_mark_amount = None
 
-            if owner is not None and chargeable:
+            should_charge = self.credits_cost is not None or completion_requires_billing
+
+            if owner is not None and should_charge:
                 default_cost = get_default_task_credit_cost()
                 amount = self.credits_cost if self.credits_cost is not None else default_cost
                 result = TaskCreditService.check_and_consume_credit_for_owner(owner, amount=amount)
@@ -5278,9 +5446,23 @@ class PersistentAgentStep(models.Model):
 
                 self.task_credit = result.get('credit')
                 if self.credits_cost is None:
-                    self.credits_cost = default_cost
+                    self.credits_cost = amount
+                if completion_to_mark is not None:
+                    completion_mark_amount = amount
+            elif completion_to_mark is not None and self.credits_cost is not None:
+                # Owner-less steps (system agents) may still want the completion marked with explicit cost.
+                completion_mark_amount = self.credits_cost
 
         result = super().save(*args, **kwargs)
+        if completion_to_mark is not None and not completion_to_mark.billed:
+            completion_to_mark.billed = True
+            completion_to_mark.billed_at = timezone.now()
+            if completion_mark_amount is not None:
+                completion_to_mark.credits_cost = completion_mark_amount
+                update_fields = ["billed", "billed_at", "credits_cost"]
+            else:
+                update_fields = ["billed", "billed_at"]
+            completion_to_mark.save(update_fields=update_fields)
         return result
 
 
